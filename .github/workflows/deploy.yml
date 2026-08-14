@@ -1,0 +1,130 @@
+###############################################################################
+# Deploy — builds all 4 service images, pushes to ECR, then does a
+# zero-downtime rolling deploy to the EC2 instances behind the ALB.
+#
+# Strategy:
+#   1. Build + push images for all 4 services in parallel (matrix)
+#   2. Run the rolling deploy script once all images are pushed
+#   3. Rolling deploy:
+#      a. Deregister instance 1 from ALB target group (stops new traffic)
+#      b. SSH (via SSM Run Command) into instance 1
+#      c. docker compose pull + docker compose up -d
+#      d. Wait for /health to return 200
+#      e. Re-register instance 1
+#      f. Repeat for instance 2
+#
+# This ensures the ALB always has at least one healthy target serving
+# traffic — no downtime for clients.
+###############################################################################
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (default: latest)"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+  id-token: write  # required for OIDC AWS auth
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false  # never cancel a mid-deploy run
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECR_REPOS_PREFIX: ${{ vars.ECR_REPOS_PREFIX || 'ecom' }}
+
+jobs:
+  # ============================================================
+  # Build + push all 4 service images in parallel
+  # ============================================================
+  build-and-push:
+    name: Build + push ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        service: [user-service, product-service, order-service, api-gateway]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "gha-build-${{ matrix.service }}"
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build + tag image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry || vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG: ${{ github.event.inputs.image_tag || 'latest' }}
+        id: build
+        run: |
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOS_PREFIX}/${{ matrix.service }}:${IMAGE_TAG}"
+          docker build \
+            -f services/${{ matrix.service }}/Dockerfile \
+            -t "$IMAGE" \
+            .
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Push to ECR
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+        run: docker push "$IMAGE"
+
+      - name: Print image URL
+        run: |
+          echo "✅ Pushed: ${{ steps.build.outputs.image }}"
+
+  # ============================================================
+  # Rolling deploy — runs AFTER all images are pushed
+  # ============================================================
+  deploy:
+    name: Rolling deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "gha-deploy"
+
+      - name: Run rolling deploy
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          TARGET_GROUP_ARN: ${{ secrets.TARGET_GROUP_ARN }}
+          IMAGE_TAG: ${{ github.event.inputs.image_tag || 'latest' }}
+        run: |
+          bash scripts/deploy_rolling.sh
+
+      - name: Verify deploy
+        env:
+          ALB_DNS: ${{ secrets.ALB_DNS }}
+        run: |
+          echo "Hitting ALB health endpoint at https://$ALB_DNS/health..."
+          for i in $(seq 1 30); do
+            if curl -fsS "http://$ALB_DNS/health" | grep -q '"status":"ok"'; then
+              echo "✅ Deploy verified at ${i}s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ Deploy verification failed"
+          exit 1

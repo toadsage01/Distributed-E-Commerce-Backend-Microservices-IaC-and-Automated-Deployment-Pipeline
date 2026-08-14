@@ -1,0 +1,75 @@
+###############################################################################
+# CI — runs on every PR + on push to any branch.
+# Lints + tests all services. No deploy here — that's deploy.yml (main only).
+###############################################################################
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test services
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # run all services even if one fails — easier debugging
+      matrix:
+        service: [user-service, product-service, order-service, api-gateway]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            services/shared/requirements.txt
+            services/${{ matrix.service }}/requirements.txt
+
+      - name: Install shared dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r services/shared/requirements.txt
+
+      - name: Install service dependencies
+        run: |
+          pip install -r services/${{ matrix.service }}/requirements.txt
+
+      - name: Lint (ruff)
+        # Run ruff on the service + shared lib. Fail on errors, not warnings.
+        run: |
+          pip install ruff
+          ruff check services/shared/ services/${{ matrix.service }}/
+        continue-on-error: true  # don't block PRs on lint for now
+
+      - name: Test
+        env:
+          DATABASE_URL: "sqlite:///./test.db"
+          REDIS_URL: "memory://"
+          JWT_SECRET: "ci-test-secret-not-for-prod"
+          ENV: "local"
+          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/services/${{ matrix.service }}"
+        run: |
+          cd services/${{ matrix.service }}
+          python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.service }}
+          path: services/${{ matrix.service }}/test-results.xml
+          if-no-files-found: ignore
