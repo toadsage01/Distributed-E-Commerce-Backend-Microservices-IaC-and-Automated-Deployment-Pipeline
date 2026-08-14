@@ -1,0 +1,145 @@
+# docker-compose.yml — local development parity with prod.
+#
+# Spins up all four services + Postgres + Redis locally. The docker-compose
+# service names (user-service, product-service, etc.) match what the services
+# expect in their default config, so `docker compose up` gives you a working
+# local environment with no .env file needed.
+#
+# In prod, the same images run on EC2 (see infra/terraform/ec2.tf). The
+# ALB points at the api-gateway container's port 8000.
+#
+# Usage:
+#   docker compose up --build          # build + start everything
+#   docker compose up -d               # detached
+#   docker compose logs -f api-gateway # follow gateway logs
+#   docker compose down -v             # tear down + remove volumes
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ecom-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ecom
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecom"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ecom-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  user-service:
+    build:
+      context: .
+      dockerfile: services/user-service/Dockerfile
+    container_name: ecom-user-service
+    environment:
+      ENV: local
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/ecom
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-only-not-for-prod-please-override}
+      ACCESS_TOKEN_TTL_MINUTES: 15
+      REFRESH_TOKEN_TTL_DAYS: 7
+      PORT: 8001
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  product-service:
+    build:
+      context: .
+      dockerfile: services/product-service/Dockerfile
+    container_name: ecom-product-service
+    environment:
+      ENV: local
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/ecom
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-only-not-for-prod-please-override}
+      PORT: 8002
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  order-service:
+    build:
+      context: .
+      dockerfile: services/order-service/Dockerfile
+    container_name: ecom-order-service
+    environment:
+      ENV: local
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/ecom
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-only-not-for-prod-please-override}
+      USER_SERVICE_URL: http://user-service:8001
+      PRODUCT_SERVICE_URL: http://product-service:8002
+      PORT: 8003
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      user-service:
+        condition: service_started
+      product-service:
+        condition: service_started
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    container_name: ecom-api-gateway
+    environment:
+      ENV: local
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-only-not-for-prod-please-override}
+      USER_SERVICE_URL: http://user-service:8001
+      PRODUCT_SERVICE_URL: http://product-service:8002
+      ORDER_SERVICE_URL: http://order-service:8003
+      RATE_LIMIT_PER_MINUTE: 100
+      PORT: 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      user-service:
+        condition: service_started
+      product-service:
+        condition: service_started
+      order-service:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

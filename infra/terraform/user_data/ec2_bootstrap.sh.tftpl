@@ -1,0 +1,141 @@
+###############################################################################
+# EC2 bootstrap script — runs on instance first boot via user_data.
+#
+# Installs Docker, docker-compose, AWS CLI v2, and the SSM agent.
+# Authenticates to ECR, pulls the latest images, and starts the stack
+# via docker-compose.
+#
+# Variables (substituted by Terraform templatefile):
+#   project_name       — e.g. "ecom"
+#   environment        — e.g. "dev"
+#   aws_region         — e.g. "us-east-1"
+#   aws_account_id     — 12-digit account ID
+#   rds_endpoint       — RDS Postgres hostname
+#   rds_secret_arn     — Secrets Manager ARN for DB creds
+#   redis_endpoint     — ElastiCache Redis hostname
+#   jwt_secret         — placeholder; real value fetched from Secrets Manager
+#   ecr_repos          — list of ECR repo names
+###############################################################################
+
+#!/bin/bash
+set -euo pipefail
+
+# --- Logging ---
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+echo "=== EC2 bootstrap starting at $(date -u) ==="
+
+# --- System update ---
+yum update -y
+
+# --- Install Docker ---
+yum install -y docker
+systemctl enable docker
+systemctl start docker
+usermod -aG docker ec2-user
+
+# --- Install docker-compose v2 ---
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
+    -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+# --- Install AWS CLI v2 (for ECR auth) ---
+yum install -y unzip
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/aws /tmp/awscliv2.zip
+
+# --- Fetch secrets from Secrets Manager ---
+# JWT secret — we pass a placeholder via user_data and replace it here.
+# In a real prod system you'd store the JWT secret in Secrets Manager
+# separately and fetch it. For resume-scope, the placeholder is fine —
+# the docker-compose .env file is generated on-the-fly below.
+JWT_SECRET=$(aws secretsmanager get-secret-value \
+    --region "${aws_region}" \
+    --secret-id "${project_name}-${environment}-jwt" \
+    --query 'SecretString' --output text 2>/dev/null || echo "${jwt_secret}")
+
+# RDS credentials
+RDS_CREDS=$(aws secretsmanager get-secret-value \
+    --region "${aws_region}" \
+    --secret-id "${rds_secret_arn}" \
+    --query 'SecretString' --output text)
+RDS_USER=$(echo "$RDS_CREDS" | jq -r .username)
+RDS_PASS=$(echo "$RDS_CREDS" | jq -r .password)
+RDS_DB=$(echo "$RDS_CREDS" | jq -r .dbname)
+
+# --- Auth to ECR ---
+aws ecr get-login-password --region "${aws_region}" \
+    | docker login --username AWS --password-stdin "${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com"
+
+# --- Create app directory + docker-compose.yml ---
+APP_DIR=/opt/ecom
+mkdir -p "$APP_DIR"
+cd "$APP_DIR"
+
+# Write the docker-compose.yml that runs the pulled images (not built locally).
+cat > docker-compose.yml <<'YAML'
+services:
+  user-service:
+    image: ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${project_name}/user-service:latest
+    environment:
+      ENV: ${environment}
+      DATABASE_URL: "postgresql+psycopg2://${RDS_USER}:${RDS_PASS}@${rds_endpoint}:5432/${RDS_DB}"
+      REDIS_URL: "redis://${redis_endpoint}:6379/0"
+      JWT_SECRET: "${JWT_SECRET}"
+    ports: ["8001:8001"]
+    restart: unless-stopped
+
+  product-service:
+    image: ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${project_name}/product-service:latest
+    environment:
+      ENV: ${environment}
+      DATABASE_URL: "postgresql+psycopg2://${RDS_USER}:${RDS_PASS}@${rds_endpoint}:5432/${RDS_DB}"
+      REDIS_URL: "redis://${redis_endpoint}:6379/0"
+      JWT_SECRET: "${JWT_SECRET}"
+    ports: ["8002:8002"]
+    restart: unless-stopped
+
+  order-service:
+    image: ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${project_name}/order-service:latest
+    environment:
+      ENV: ${environment}
+      DATABASE_URL: "postgresql+psycopg2://${RDS_USER}:${RDS_PASS}@${rds_endpoint}:5432/${RDS_DB}"
+      REDIS_URL: "redis://${redis_endpoint}:6379/0"
+      JWT_SECRET: "${JWT_SECRET}"
+      USER_SERVICE_URL: http://user-service:8001
+      PRODUCT_SERVICE_URL: http://product-service:8002
+    ports: ["8003:8003"]
+    restart: unless-stopped
+
+  api-gateway:
+    image: ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${project_name}/api-gateway:latest
+    environment:
+      ENV: ${environment}
+      REDIS_URL: "redis://${redis_endpoint}:6379/0"
+      JWT_SECRET: "${JWT_SECRET}"
+      USER_SERVICE_URL: http://user-service:8001
+      PRODUCT_SERVICE_URL: http://product-service:8002
+      ORDER_SERVICE_URL: http://order-service:8003
+      RATE_LIMIT_PER_MINUTE: 100
+    ports: ["8000:8000"]
+    depends_on: [user-service, product-service, order-service]
+    restart: unless-stopped
+YAML
+
+# --- Pull + start ---
+docker compose pull
+docker compose up -d
+
+# --- Wait for gateway health check ---
+echo "Waiting for gateway to be healthy..."
+for i in $(seq 1 30); do
+    if curl -fsS http://localhost:8000/health > /dev/null 2>&1; then
+        echo "Gateway is healthy after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+echo "=== EC2 bootstrap complete at $(date -u) ==="

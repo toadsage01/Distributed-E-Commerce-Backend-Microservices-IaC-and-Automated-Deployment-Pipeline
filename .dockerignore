@@ -1,0 +1,41 @@
+# Docker build context is the repo root (so Dockerfiles can COPY services/shared/).
+# We exclude everything not needed in the image to keep build context small
+# and avoid cache invalidation on irrelevant file changes.
+
+# VCS
+.git
+.gitignore
+.github
+
+# Python cache
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Test databases (created by SQLite during tests)
+**/test_*.db
+
+# IDE
+.vscode
+.idea
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs / IaC not needed in app image
+docs/
+infra/
+load_tests/
+scripts/
+*.md
+
+# Env files (secrets must not be baked into images)
+.env
+.env.*
+*.env
